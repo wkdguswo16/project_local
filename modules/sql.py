@@ -1,10 +1,12 @@
 from abc import *
 import pymysql
-import json
-env = json.loads(open('secret_key.json', 'r').read())['sql']
+import sqlite3
+from random import randint
+from modules.env import ENV
+env_main = ENV.sql
+conn = pymysql.connect(host=env_main.link, user=env_main.account,
+                        password=env_main.password, db=env_main.db, charset='utf8')
 
-conn = pymysql.connect(host=env['link'], user=env['account'],
-                        password=env['password'], db=env['db'], charset='utf8')
 def get_db():
     return conn.cursor()
 def commit():
@@ -49,7 +51,6 @@ class RDMS(metaclass=ABCMeta):
             (identifier),
         )  
         db.commit()  
-
 
 class User(RDMS):
     DBNAME = 'student_info'
@@ -142,7 +143,6 @@ class Department(RDMS):
         )
         commit()
 
-
 class LockRegion(RDMS):
     DBNAME = 'locker_region'
 
@@ -174,7 +174,7 @@ class LockRegion(RDMS):
     def create(id_, dep_id, name):
         db = get_db()
         db.execute(
-            f"INSERT INTO `{LockRegion.DBNAME}` (reg_id, dep_id, name) VALUES (%s, %s, %s)",
+            f"INSERT INTO `{LockRegion.DBNAME}` (id, dep_id, name) VALUES (%s, %s, %s)",
             (id_, dep_id, name),
         )
         commit()
@@ -236,8 +236,10 @@ class LockInfo(RDMS):
     def create(own_id, reg_id, pos, use):
         db = get_db()
         db.execute(
-           f"INSERT INTO `{LockInfo.DBNAME}` (own_id, reg_id, pos, use) VALUES(%s, %s, %s, %s)",
-           (own_id, reg_id, pos, use),
+           f"""INSERT INTO `{LockInfo.DBNAME}` 
+           (own_id, reg_id, pos, `use`) 
+           VALUES (%s, %s, %s, %s)""",
+           (own_id, reg_id, pos, use)
         )
         commit()
 
@@ -270,17 +272,20 @@ class LockInfo(RDMS):
     
 class LockUsage(RDMS):
     DBNAME = 'locker_usage'
-    
-    def __init__(self, token, own_id, id_, state, exp_date):
+    UNUSE = 0
+    USE = 1
+
+    def __init__(self, token, own_id, id_, state, exp_date, uuid):
         self.token = int(token)
         self.own_id = int(own_id)
         self.stu_id = id_
         self.state = int(state)
         self.exp_date = exp_date
-        
+        self.uuid = uuid
+
     def __repr__(self):
         return f"LockUsage_{self.token}(own_id={self.own_id}, stu_id={self.stu_id}, state={self.state}, self.exp_date={self.exp_date})"
-    
+
     @staticmethod
     def get(token):
         usage = LockUsage.get_one_raw(
@@ -289,7 +294,7 @@ class LockUsage(RDMS):
         if not usage:
             return None
         return LockUsage(*usage)
-        
+
     @staticmethod
     def get_by_stu_id(stu_id):
         db = get_db()
@@ -302,8 +307,21 @@ class LockUsage(RDMS):
             return None
         result = LockUsage(*token)
         return result
+    
+    @staticmethod
+    def get_by_own_id(own_id):
+        db = get_db()
+        db.execute(
+            f"SELECT * FROM `{LockUsage.DBNAME}` WHERE own_id = %s AND state = 1 LIMIT 1", (
+                own_id,)
+        )
+        token = db.fetchone()
+        if not token:
+            return None
+        result = LockUsage(*token)
+        return result
 
-    @staticmethod 
+    @staticmethod
     def get_stu_id_by_token(token):
         stu_id = LockUsage.get_one_raw(
             'token', token, LockUsage.DBNAME
@@ -313,7 +331,7 @@ class LockUsage(RDMS):
         result = LockUsage(*stu_id)
         return result.stu_id
 
-    @staticmethod 
+    @staticmethod
     def get_own_id_by_token(token):
         own_id = LockUsage.get_one_raw(
             'token', token, LockUsage.DBNAME
@@ -324,18 +342,24 @@ class LockUsage(RDMS):
         return result.own_id
 
     @staticmethod
-    def create(token, own_id, stu_id):
+    def create(token, locker:LockInfo, user:User):
+        uuid = gen_uuid()
         db = get_db()
         db.execute(
-            f"INSERT INTO `{LockUsage.DBNAME}` (token, own_id, stu_id, state, exp_date) VALUES (%s, %s, %s, 0, DATE_ADD(NOW(), INTERVAL 3 MONTH))",
-            (token, own_id, stu_id),
+            f"INSERT INTO `{LockUsage.DBNAME}` (token, own_id, stu_id, state, exp_date, uuid) VALUES (%s, %s, %s, 1, DATE_ADD(NOW(), INTERVAL 3 MONTH), %s)",
+            (token, locker.own_id, user.id, uuid),
         )
         commit()
-        
-    @staticmethod
-    def delete_by_token(token):
-        LockUsage.delete('token', token, LockUsage.DBNAME)
-    
+        locker.update_use(LockUsage.USE)
+        # LockInfo.update_use_by_own_id(locker.own_id, LockUsage.USE)
+
+    def disable(self):
+        locker = LockInfo(self.own_id)
+        locker.update_use(LockUsage.UNUSE)
+        db = get_db()
+        db.execute(f"UPDATE {LockUsage.DBNAME} SET state = %s WHERE token = %s", 0, self.token)
+        commit()
+
     @staticmethod
     def update_by_token(token):
         state = LockUsage.get_one_raw(
@@ -343,27 +367,26 @@ class LockUsage(RDMS):
         )
         if not state:
             return None
-        if(state[3] == 1):
+        if (state[3] == 1):
             state = 0
         else:
-            state = 1 
+            state = 1
         db = get_db()
         db.execute(
             f"UPDATE `{LockUsage.DBNAME}` SET `state` = %s WHERE `token` = %s",
             (state, token),
         )
         commit()
-        
+
     def get_logs(self) -> list:
-        v =  LockLog.get_by_token(self.token)
-        if(not v):
+        v = LockLog.get_by_token(self.token)
+        if (not v):
             return []
         return v[::-1]
-    
+
     def get_locker_info(self):
         return LockInfo.get(self.own_id)
-    
-    
+
 class LockLog(RDMS):
     DBNAME = 'locker_log'
     
@@ -394,22 +417,22 @@ class LockLog(RDMS):
         
         return [LockLog(*log) for log in locker_logs]
     
-    @staticmethod
-    def create_by_token(token, val):
-        if val == "opened":
-           state = True
-        else:
-            state = False
-        db = get_db()
-        db.execute(
-            f"INSERT INTO `{LockLog.DBNAME}` (token, create_time, is_open) VALUES (%s, NOW(), %s)",
-            (token, state),
-        )
-        commit()
+
         
     @staticmethod
     def delete_by_token(token):
         LockLog.delete('token', token, LockLog.DBNAME)
+        
+    @staticmethod
+    def create_by_token(usage:LockUsage, val):
+        db = get_db()
+        db.execute(
+            f"INSERT INTO `{LockLog.DBNAME}` (token, create_time, is_open) VALUES (%s, NOW(), %s)",
+            (usage.token, val),
+        )
+        commit()
+
+
     
 class activateFunc(User, Department, LockRegion, LockInfo, LockLog, LockUsage):
     
@@ -456,3 +479,18 @@ class activateFunc(User, Department, LockRegion, LockInfo, LockLog, LockUsage):
         LockInfo.update_use_by_own_id(own_id)
         LockUsage.delete_by_token(token)
         commit()
+
+local_conn = sqlite3.connect("region.db")
+local_cur = local_conn.cursor()
+try:
+    local_cur.execute("SELECT id FROM region")
+except:
+    print("there is no db")
+    reg_id = randint(10000000, 99999999)
+    local_conn.execute("CREATE TABLE region(id INTEGER)")
+    local_cur.execute("INSERT INTO region VALUES(?)", (reg_id, ))
+    local_conn.commit()
+    LockRegion.create(reg_id, ENV.departure, ENV.position)
+    print("create complete")
+    local_cur.execute("SELECT id FROM region")
+region_id = local_cur.fetchone()
